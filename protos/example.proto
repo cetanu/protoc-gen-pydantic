@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package tutorial;
 
+import "nested/example.proto";
+
 message Person {
   string name = 1;
   int32 id = 2;  // Unique ID number for this person.
@@ -16,6 +18,10 @@ message Person {
   message PhoneNumber {
     string number = 1;
     PhoneType type = 2;
+
+    message Triply {
+        string name = 1;
+    }
   }
 
   repeated PhoneNumber phones = 4;
@@ -26,14 +32,12 @@ message AddressBook {
   repeated Person people = 1;
 }
 
+message Foo {
+    tutorial.nested.Something something = 1;
+    map<string, string> data = 2;
+    map<int32, AddressBook> books = 3;
+}
 
-/* 
-
-package/
-  __init__.py
-  person/
-    __init__.py
-    phonenumber/
-      __init__.py
-  
-*/
+message Bar {
+    tutorial.Person.PhoneNumber.Triply triply = 1;
+}

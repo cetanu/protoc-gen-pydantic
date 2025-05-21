@@ -1,22 +1,159 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use protobuf::descriptor::field_descriptor_proto::Type;
-use protobuf::descriptor::{field_descriptor_proto, DescriptorProto};
+use protobuf::descriptor::field_descriptor_proto::{
+    Label,
+    Type::{self, *},
+};
+use protobuf::descriptor::{
+    field_descriptor_proto, DescriptorProto, EnumDescriptorProto, FieldDescriptorProto,
+    FileDescriptorProto,
+};
 use protobuf::plugin::code_generator_response::Feature::FEATURE_PROTO3_OPTIONAL;
 use protobuf::plugin::{CodeGeneratorRequest, CodeGeneratorResponse};
 use protobuf::Message;
 
+#[derive(Default)]
+struct PythonModule {}
+
+#[derive(Default, Debug, Eq, PartialEq, Hash)]
+struct PythonArgument {
+    type_: String,
+    default: String,
+}
+
+#[derive(Default)]
+struct GeneratorContext<'ctx> {
+    package_name: &'ctx str,
+    processed: HashSet<PathBuf, PythonModule>,
+    type_refs: Mutex<HashMap<&'ctx str, PythonArgument>>,
+}
+
+struct MessageContext<'ctx> {
+    message_name: &'ctx str,
+    location: &'ctx str,
+}
+
+impl<'ctx> MessageContext<'ctx> {
+    fn new(message_name: &'ctx str, location: &'ctx str) -> Self {
+        Self {
+            message_name,
+            location,
+        }
+    }
+}
+
+impl<'ctx> GeneratorContext<'ctx> {
+    fn new(package_name: &'ctx str) -> Self {
+        Self {
+            package_name,
+            ..Default::default()
+        }
+    }
+
+    fn process_maps(&self, messages: &'ctx [DescriptorProto]) {
+        for msg in messages.iter().filter(|p| p.options.map_entry()) {
+            if let Ok(mut refs) = self.type_refs.lock() {
+                let key = map_proto_type_to_py_type(&msg.field[0]).unwrap();
+                let value = map_proto_type_to_py_type(&msg.field[1]).unwrap();
+                refs.entry(msg.name()).or_insert(PythonArgument {
+                    type_: format!("{}, {}", key, value),
+                    default: String::from("Field(default_factory=dict)"),
+                });
+            }
+        }
+        for msg in messages.iter() {
+            self.process_maps(&msg.nested_type);
+        }
+    }
+
+    fn process_messages(&self, messages: &'ctx [DescriptorProto]) {
+        for msg in messages.iter().filter(|p| !p.options.map_entry()) {
+            let ctx = MessageContext::new(msg.name(), self.package_name);
+            // eprintln!("\n# File: {}/__init__.py", self.package_name);
+            eprintln!("\nclass {}(pydantic.BaseModel)", msg.name());
+            self.process_fields(&msg.field, ctx);
+            self.process_messages(&msg.nested_type);
+            self.process_enums(&msg.enum_type);
+        }
+    }
+    fn process_enums(&self, enums: &[EnumDescriptorProto]) {
+        for enum_ in enums {
+            eprintln!("\nclass {}(enum.Enum)", enum_.name());
+            for variant in &enum_.value {
+                eprintln!("    {} = {}", variant.name(), variant.number() + 1);
+            }
+        }
+    }
+
+    fn process_fields(&self, fields: &[FieldDescriptorProto], ctx: MessageContext) {
+        for field in fields {
+            if field.type_name().ends_with("Entry") {
+                if let Some((_path, obj)) = field.type_name().rsplit_once(".") {
+                    if let Ok(refs) = self.type_refs.lock() {
+                        if let Some(type_ref) = refs.get(obj) {
+                            eprintln!(
+                                "    {}: dict[{}] = {}",
+                                field.name(),
+                                type_ref.type_,
+                                type_ref.default
+                            );
+                            continue;
+                        } else {
+                            eprintln!("# Key {} not in type_refs: {:?}", obj, refs);
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "    {}: {}",
+                field.name(),
+                map_proto_type_to_py_type(field).unwrap()
+            );
+        }
+    }
+}
+
+fn map_proto_type_to_py_type(f: &FieldDescriptorProto) -> Option<String> {
+    Some(
+        match f.type_() {
+            TYPE_MESSAGE | TYPE_ENUM => return f.type_name().strip_prefix(".").map(String::from),
+            TYPE_BOOL => "bool",
+            TYPE_STRING => "str",
+            TYPE_BYTES => "bytes",
+            TYPE_GROUP => panic!(),
+            TYPE_DOUBLE | TYPE_FLOAT => "float",
+            TYPE_SINT32 | TYPE_SINT64 | TYPE_INT64 | TYPE_UINT64 | TYPE_INT32 | TYPE_FIXED32
+            | TYPE_FIXED64 | TYPE_SFIXED32 | TYPE_SFIXED64 | TYPE_UINT32 => "int",
+        }
+        .to_string(),
+    )
+}
+
 fn main() -> io::Result<()> {
-    println!("Starting...");
     let request = CodeGeneratorRequest::parse_from_reader(&mut io::stdin()).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("Could not parse codegen req: {e}"),
         )
     })?;
-    println!("Request: {:?}", request);
+
+    for proto in request.proto_file.iter() {
+        // dbg!(proto);
+        let package = proto.package().replace(".", "/");
+        let ctx = GeneratorContext::new(package.as_str());
+        eprintln!("--------------\n# Module: {}", package);
+        if proto.dependency.len() > 0 {
+            eprintln!("# TODO: import stuff from {}", proto.dependency.join("\n"));
+        }
+        // Process maps first to avoid creating classes for them
+        ctx.process_maps(&proto.message_type);
+        ctx.process_messages(&proto.message_type);
+        ctx.process_enums(&proto.enum_type);
+    }
 
     let response = match generate_code(request) {
         Ok(resp) => resp,
@@ -34,7 +171,6 @@ fn main() -> io::Result<()> {
             format!("Failed to serialize codegen resp: {e}"),
         )
     })?;
-
     io::stdout().write_all(&output)
 }
 
@@ -46,92 +182,4 @@ fn generate_code(request: CodeGeneratorRequest) -> Result<CodeGeneratorResponse,
     }
     response.set_supported_features(FEATURE_PROTO3_OPTIONAL as u64);
     Ok(response)
-}
-
-fn process_files(request: &CodeGeneratorRequest) -> Result<(), Box<dyn Error>> {
-    let files_to_gen: HashSet<&str> = request
-        .file_to_generate
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-
-    for descriptor in request.proto_file.iter() {
-        let name = descriptor.name();
-        if !files_to_gen.contains(name) {
-            continue; // not marked for generation
-        }
-        println!("Processing file: {name}");
-        if descriptor.has_package() {
-            println!("Package: {}", descriptor.package());
-        }
-
-        for message in descriptor.message_type.iter() {
-            todo!()
-        }
-
-        for enum_ in descriptor.enum_type.iter() {
-            todo!()
-        }
-    }
-
-    Ok(())
-}
-
-fn generate_pydantic_model(message: &DescriptorProto) -> Result<String, std::io::Error> {
-    let indent = "    ";
-    let mut output = Vec::new();
-    writeln!(output, "class {}(pydantic.BaseModel):", message.name())?;
-    if message.field.is_empty() {
-        writeln!(output, "{indent}pass")?;
-    } else {
-        for field in message.field.iter() {
-            let type_ = map_proto_type_to_py(field.type_());
-            writeln!(
-                output,
-                "{indent}{}: {type_} | None = Field(None, default_factory={type_})",
-                field.name(),
-            )?;
-        }
-    }
-    String::from_utf8(output).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Failed to decode generated pydantic model: {e}"),
-        )
-    })
-}
-
-fn map_proto_type_to_py(proto_type: Type) -> &'static str {
-    match proto_type {
-        Type::TYPE_STRING => "str",
-        Type::TYPE_DOUBLE | Type::TYPE_FLOAT => "float",
-        Type::TYPE_INT64 | Type::TYPE_UINT64 | Type::TYPE_INT32 | Type::TYPE_UINT32 => todo!(),
-        Type::TYPE_FIXED64 => todo!(),
-        Type::TYPE_FIXED32 => todo!(),
-        Type::TYPE_BOOL => "bool",
-        Type::TYPE_GROUP => todo!(),
-        Type::TYPE_MESSAGE => todo!(),
-        Type::TYPE_BYTES => todo!(),
-        Type::TYPE_ENUM => todo!(),
-        Type::TYPE_SFIXED32 => todo!(),
-        Type::TYPE_SFIXED64 => todo!(),
-        Type::TYPE_SINT32 => todo!(),
-        Type::TYPE_SINT64 => todo!(),
-        _ => "typing.Any",
-    }
-}
-
-struct PythonField {
-    name: String,
-    type_hint: String,
-    value: String,
-}
-
-struct PythonEnum {
-    variants: Vec<PythonField>,
-}
-
-struct PythonClass {
-    subclasses: Vec<String>,
-    fields: Vec<PythonField>,
 }
